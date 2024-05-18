@@ -1,7 +1,11 @@
-// src/worker.js
+// worker.src.js
 import { connect } from "cloudflare:sockets";
 let password = 'auto';
 let proxyIP = '';
+// The user name and password do not contain special characters
+// Setting the address will ignore proxyIP
+// Example:  user:pass@host:port  or  host:port
+let socks5Address = '';
 
 let addresses = [
 	//当sub为空时启用本地优选域名/优选IP，若不带端口号 TLS默认端口为443，#号后为备注别名
@@ -13,11 +17,11 @@ let addresses = [
 	'www.csgo.com:2087#节点名放在井号之后即可',
 	'icook.hk#若不带端口号默认端口为443',
 	'104.17.152.41#IP也可以',
-	//'[2606:4700:e7:25:4b9:f8f8:9bfb:774a]#IPv6也OK',
+	'[2606:4700:e7:25:4b9:f8f8:9bfb:774a]#IPv6也OK',
 ];
 
-let sub = '';// 'trojan.fxxk.dedyn.io' 
-let subconverter = 'apiurl.v1.mk';// clash订阅转换后端，目前使用肥羊的订阅转换功能。自带虚假节点信息防泄露
+let sub = ''; 
+let subconverter = 'url.v1.mk';// clash订阅转换后端，目前使用肥羊的订阅转换功能。自带虚假节点信息防泄露
 let subconfig = "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online_Mini.ini"; //订阅配置文件
 let RproxyIP = 'false';
 
@@ -31,16 +35,22 @@ let ChatID ='';
 let proxyhosts = [];//本地代理域名池
 let proxyhostsURL = 'https://raw.githubusercontent.com/cmliu/CFcdnVmess2sub/main/proxyhosts';//在线代理域名池URL
 
-let fakeUserID = generateUUID();
-let fakeHostName = generateRandomString();
+let fakeUserID ;
+let fakeHostName ;
 let proxyIPs ;
 let sha224Password ;
+const expire = 4102329600;//2099-12-31
 const regex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[.*\]):?(\d+)?#?(.*)?$/;
+
 /*
 if (!isValidSHA224(sha224Password)) {
     throw new Error('sha224Password is not valid');
 }
 */
+
+let parsedSocks5Address = {}; 
+let enableSocks = false;
+
 export default {
 	async fetch(request, env, ctx) {
 		try {
@@ -49,6 +59,22 @@ export default {
 			proxyIP = env.PROXYIP || proxyIP;
 			proxyIPs = await ADD(proxyIP);
 			proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+			socks5Address = env.SOCKS5 || socks5Address;
+			if (socks5Address) {
+				try {
+					parsedSocks5Address = socks5AddressParser(socks5Address);
+					RproxyIP = env.RPROXYIP || 'false';
+					enableSocks = true;
+				} catch (err) {
+  					/** @type {Error} */ 
+					let e = err;
+					console.log(e.toString());
+					RproxyIP = env.RPROXYIP || !proxyIP ? 'true' : 'false';
+					enableSocks = false;
+				}
+			} else {
+				RproxyIP = env.RPROXYIP || !proxyIP ? 'true' : 'false';
+			}
 			password = env.PASSWORD || password;
 			sha224Password = env.SHA224 || env.SHA224PASS || sha256.sha224(password);
 			//console.log(sha224Password);
@@ -67,6 +93,14 @@ export default {
 			FileName = env.SUBNAME || FileName;
 			RproxyIP = env.RPROXYIP || !proxyIP ? 'true' : 'false';
 
+			const currentDate = new Date();
+			currentDate.setHours(0, 0, 0, 0); // 设置时间为当天
+			const timestamp = Math.ceil(currentDate.getTime() / 1000);
+			const fakeUserIDMD5 = await MD5MD5(`${password}${timestamp}`);
+			fakeUserID = fakeUserIDMD5.slice(0, 8) + "-" + fakeUserIDMD5.slice(8, 12) + "-" + fakeUserIDMD5.slice(12, 16) + "-" + fakeUserIDMD5.slice(16, 20) + "-" + fakeUserIDMD5.slice(20);
+			fakeHostName = fakeUserIDMD5.slice(6, 9) + "." + fakeUserIDMD5.slice(13, 19);
+			//console.log(fakeUserID); // 打印fakeID
+
 			if (!upgradeHeader || upgradeHeader !== "websocket") {
 				//const url = new URL(request.url);
 				switch (url.pathname) {
@@ -78,44 +112,57 @@ export default {
 						return envKey === 'URL302' ? Response.redirect(URL, 302) : fetch(new Request(URL, request));
 					}
 					return new Response(JSON.stringify(request.cf, null, 4), { status: 200 });
+				case `/${fakeUserID}`:
+					const fakeConfig = await getTrojanConfig(password, request.headers.get('Host'), sub, 'CF-Workers-SUB', RproxyIP, url);
+					return new Response(`${fakeConfig}`, { status: 200 });
 				case `/${password}`:
 					await sendMessage(`#获取订阅 ${FileName}`, request.headers.get('CF-Connecting-IP'), `UA: ${UA}</tg-spoiler>\n域名: ${url.hostname}\n<tg-spoiler>入口: ${url.pathname + url.search}</tg-spoiler>`);
 					const trojanConfig = await getTrojanConfig(password, request.headers.get('Host'), sub, UA, RproxyIP, url);
 					const now = Date.now();
 					//const timestamp = Math.floor(now / 1000);
-					const expire = 4102329600;//2099-12-31
 					const today = new Date(now);
 					today.setHours(0, 0, 0, 0);
 					const UD = Math.floor(((now - today.getTime())/86400000) * 24 * 1099511627776 / 2);
+					let pagesSum = UD;
+					let workersSum = UD;
+					let total = 24 * 1099511627776 ;
+					if (env.CFEMAIL && env.CFKEY){
+						const email = env.CFEMAIL;
+						const key = env.CFKEY;
+						const accountIndex = env.CFID || 0;
+						const accountId = await getAccountId(email, key);
+						if (accountId){
+							const now = new Date()
+							now.setUTCHours(0, 0, 0, 0)
+							const startDate = now.toISOString()
+							const endDate = new Date().toISOString();
+							const Sum = await getSum(accountId, accountIndex, email, key, startDate, endDate);
+							pagesSum = Sum[0];
+							workersSum = Sum[1];
+							total = 102400 ;
+						}
+					}
+					//console.log(`pagesSum: ${pagesSum}\nworkersSum: ${workersSum}\ntotal: ${total}`);
 					if (userAgent && (userAgent.includes('mozilla') || userAgent.includes('subconverter'))){
 						return new Response(`${trojanConfig}`, {
 							status: 200,
 							headers: {
 								"Content-Type": "text/plain;charset=utf-8",
 								"Profile-Update-Interval": "6",
-								"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${24 * 1099511627776}; expire=${expire}`,
+								"Subscription-Userinfo": `upload=${pagesSum}; download=${workersSum}; total=${total}; expire=${expire}`,
 							}
 						});
 					} else {
 						return new Response(`${trojanConfig}`, {
 							status: 200,
 							headers: {
-								"Content-Disposition": `attachment; filename=${FileName}; filename*=utf-8''${FileName}`,
+								"Content-Disposition": `attachment; filename=${FileName}; filename*=utf-8''${encodeURIComponent(FileName)}`,
 								"Content-Type": "text/plain;charset=utf-8",
 								"Profile-Update-Interval": "6",
-								"Subscription-Userinfo": `upload=${UD}; download=${UD}; total=${24 * 1099511627776}; expire=${expire}`,
+								"Subscription-Userinfo": `upload=${pagesSum}; download=${workersSum}; total=${total}; expire=${expire}`,
 							}
 						});
 					}
-					/*
-					const host = request.headers.get('Host');
-					return new Response(`trojan://${encodeURIComponent(password)}@${host}:443/?type=ws&host=${host}&security=tls`, {
-						status: 200,
-						headers: {
-							"Content-Type": "text/plain;charset=utf-8",
-						}
-					});
-					*/
 				default:
 					return new Response("Incorrect password!!!", { status: 404 });
 				}
@@ -124,6 +171,31 @@ export default {
 				if (new RegExp('/proxyip=', 'i').test(url.pathname)) proxyIP = url.pathname.toLowerCase().split('/proxyip=')[1];
 				else if (new RegExp('/proxyip.', 'i').test(url.pathname)) proxyIP = `proxyip.${url.pathname.toLowerCase().split("/proxyip.")[1]}`;
 				else if (!proxyIP || proxyIP == '') proxyIP = 'proxyip.fxxk.dedyn.io';
+
+				socks5Address = url.searchParams.get('socks5') || socks5Address;
+				if (new RegExp('/socks5=', 'i').test(url.pathname)) socks5Address = url.pathname.split('5=')[1];
+				else if (new RegExp('/socks://', 'i').test(url.pathname) || new RegExp('/socks5://', 'i').test(url.pathname)) {
+					socks5Address = url.pathname.split('://')[1].split('#')[0];
+					if (socks5Address.includes('@')){
+						let userPassword = socks5Address.split('@')[0];
+						const base64Regex = /^(?:[A-Z0-9+/]{4})*(?:[A-Z0-9+/]{2}==|[A-Z0-9+/]{3}=)?$/i;
+						if (base64Regex.test(userPassword) && !userPassword.includes(':')) userPassword = atob(userPassword);
+						socks5Address = `${userPassword}@${socks5Address.split('@')[1]}`;
+					}
+				}
+				if (socks5Address) {
+					try {
+						parsedSocks5Address = socks5AddressParser(socks5Address);
+						enableSocks = true;
+					} catch (err) {
+						/** @type {Error} */ 
+						let e = err;
+						console.log(e.toString());
+						enableSocks = false;
+					}
+				} else {
+					enableSocks = false;
+				}
 				return await trojanOverWSHandler(request);
 			}
 		} catch (err) {
@@ -164,7 +236,8 @@ async function trojanOverWSHandler(request) {
 				message,
 				portRemote = 443,
 				addressRemote = "",
-				rawClientData
+				rawClientData,
+				addressType
 			} = await parseTrojanHeader(chunk);
 			address = addressRemote;
 			portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
@@ -172,7 +245,7 @@ async function trojanOverWSHandler(request) {
 				throw new Error(message);
 				return;
 			}
-			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, log);
+			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, log, addressType);
 		},
 		close() {
 			log(`readableWebSocketStream is closed`);
@@ -282,13 +355,15 @@ async function parseTrojanHeader(buffer) {
 		hasError: false,
 		addressRemote: address,
 		portRemote,
-		rawClientData: socks5DataBuffer.slice(portIndex + 4)
+		rawClientData: socks5DataBuffer.slice(portIndex + 4),
+		addressType: atype
 	};
 }
 
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, log) {
-	async function connectAndWrite(address, port) {
-		const tcpSocket2 = connect({
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, log, addressType) {
+	async function connectAndWrite(address, port, socks = false) {
+		const tcpSocket2 = socks ? await socks5Connect(addressType, address, port, log)
+		: connect({
 			hostname: address,
 			port
 		});
@@ -300,7 +375,12 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 		return tcpSocket2;
 	}
 	async function retry() {
-		const tcpSocket2 = await connectAndWrite(proxyIP || addressRemote, portRemote);
+		let tcpSocket2
+		if (enableSocks) {
+			tcpSocket2 = await connectAndWrite(addressRemote, portRemote, true);
+		} else {
+			tcpSocket2 = await connectAndWrite(proxyIP || addressRemote, portRemote);
+		}
 		tcpSocket2.closed.catch((error) => {
 			console.log("retry tcpSocket closed error", error);
 		}).finally(() => {
@@ -436,40 +516,24 @@ export {
 function revertFakeInfo(content, userID, hostName, isBase64) {
 	if (isBase64) content = atob(content);//Base64解码
 	content = content.replace(new RegExp(fakeUserID, 'g'), userID).replace(new RegExp(fakeHostName, 'g'), hostName);
+	//console.log(content);
 	if (isBase64) content = btoa(content);//Base64编码
 
 	return content;
 }
 
-function generateRandomNumber() {
-	let minNum = 100000;
-	let maxNum = 999999;
-	return Math.floor(Math.random() * (maxNum - minNum + 1)) + minNum;
-}
+async function MD5MD5(text) {
+	const encoder = new TextEncoder();
+  
+	const firstPass = await crypto.subtle.digest('MD5', encoder.encode(text));
+	const firstPassArray = Array.from(new Uint8Array(firstPass));
+	const firstHex = firstPassArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-function generateRandomString() {
-	let minLength = 2;
-	let maxLength = 3;
-	let length = Math.floor(Math.random() * (maxLength - minLength + 1)) + minLength;
-	let characters = 'abcdefghijklmnopqrstuvwxyz';
-	let result = '';
-	for (let i = 0; i < length; i++) {
-		result += characters[Math.floor(Math.random() * characters.length)];
-	}
-	return result;
-}
-
-function generateUUID() {
-	let uuid = '';
-	for (let i = 0; i < 32; i++) {
-		let num = Math.floor(Math.random() * 16);
-		if (num < 10) {
-			uuid += num;
-		} else {
-			uuid += String.fromCharCode(num + 55);
-		}
-	}
-	return uuid.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5').toLowerCase();
+	const secondPass = await crypto.subtle.digest('MD5', encoder.encode(firstHex.slice(7, 27)));
+	const secondPassArray = Array.from(new Uint8Array(secondPass));
+	const secondHex = secondPassArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  
+	return secondHex.toLowerCase();
 }
 
 async function ADD(envadd) {
@@ -571,47 +635,44 @@ https://github.com/cmliu/epeius
 		}
 		// 如果是使用默认域名，则改成一个workers的域名，订阅器会加上代理
 		if (hostName.includes(".workers.dev") || hostName.includes(".pages.dev")){
-			fakeHostName = `${fakeHostName}.${generateRandomString()}${generateRandomNumber()}.workers.dev`;
+			fakeHostName = `${fakeHostName}.workers.dev`;
 		} else {
-			fakeHostName = `${fakeHostName}.${generateRandomNumber()}.xyz`
+			fakeHostName = `${fakeHostName}.xyz`
 		}
-
-		if(hostName.includes('workers.dev') || hostName.includes('pages.dev')) {
-			if (proxyhostsURL && (!proxyhosts || proxyhosts.length == 0)) {
-				try {
-					const response = await fetch(proxyhostsURL); 
-				
-					if (!response.ok) {
-						console.error('获取地址时出错:', response.status, response.statusText);
-						return; // 如果有错误，直接返回
-					}
-				
-					const text = await response.text();
-					const lines = text.split('\n');
-					// 过滤掉空行或只包含空白字符的行
-					const nonEmptyLines = lines.filter(line => line.trim() !== '');
-				
-					proxyhosts = proxyhosts.concat(nonEmptyLines);
-				} catch (error) {
-					console.error('获取地址时出错:', error);
-				}
-			}
-			// 使用Set对象去重
-			proxyhosts = [...new Set(proxyhosts)];
-		}
-
-		const newAddressesapi = await getAddressesapi(addressesapi);
-		const newAddressescsv = await getAddressescsv('TRUE');
 
 		let url = `https://${sub}/sub?host=${fakeHostName}&pw=${fakeUserID}&password=${fakeUserID}&epeius=cmliu&proxyip=${RproxyIP}`;
 		let isBase64 = true;
+		let newAddressesapi;
+		let newAddressescsv;
 
-		if (!sub || sub == ""){
-			const 生成本地节点 = await subAddresses(fakeHostName,fakeUserID,'subconverter',newAddressesapi,newAddressescsv);
-			const 解码本地节点 = atob(生成本地节点)
-			const 本地节点数组 = 解码本地节点.split('\n');
-			url = 本地节点数组.join('|');
-			//console.log(url);
+		if (!sub || sub == "") {
+			if(hostName.includes('workers.dev') || hostName.includes('pages.dev')) {
+				if (proxyhostsURL && (!proxyhosts || proxyhosts.length == 0)) {
+					try {
+						const response = await fetch(proxyhostsURL); 
+					
+						if (!response.ok) {
+							console.error('获取地址时出错:', response.status, response.statusText);
+							return; // 如果有错误，直接返回
+						}
+					
+						const text = await response.text();
+						const lines = text.split('\n');
+						// 过滤掉空行或只包含空白字符的行
+						const nonEmptyLines = lines.filter(line => line.trim() !== '');
+					
+						proxyhosts = proxyhosts.concat(nonEmptyLines);
+					} catch (error) {
+						console.error('获取地址时出错:', error);
+					}
+				}
+				// 使用Set对象去重
+				proxyhosts = [...new Set(proxyhosts)];
+			}
+	
+			newAddressesapi = await getAddressesapi(addressesapi);
+			newAddressescsv = await getAddressescsv('TRUE');
+			url = `https://${hostName}/${fakeUserID}`;
 		} 
 
 		if (!userAgent.includes(('CF-Workers-SUB').toLowerCase())){
@@ -638,10 +699,12 @@ https://github.com/cmliu/epeius
 					}});
 				content = await response.text();
 			}
-			let 输出内容 = revertFakeInfo(content, password, hostName, isBase64);
-			if (userAgent.includes('surge') || _url.searchParams.has('surge')) 输出内容 = surge(输出内容, hostName);
-			//console.log(输出内容);
-			return 输出内容;
+
+			if (!_url.pathname.includes(`/${fakeUserID}`)) {
+				content = revertFakeInfo(content, password, hostName, isBase64);
+				if (userAgent.includes('surge') || _url.searchParams.has('surge')) content = surge(content, `https://${hostName}/${password}?surge`);	
+			} 
+			return content;
 		} catch (error) {
 			console.error('Error fetching content:', error);
 			return `Error fetching content: ${error.message}`;
@@ -843,12 +906,28 @@ async function getAddressescsv(tls) {
 	return newAddressescsv;
 }
 
-function surge(content, host) {
-	const 备改内容 = `skip-cert-verify=true, tfo=false, udp-relay=false`;
-	const 正确内容 = `skip-cert-verify=true, ws=true, ws-path=/?ed=2560, ws-headers=Host:"${host}", tfo=false, udp-relay=false`;
-	content = content.replace(new RegExp(备改内容, 'g'), 正确内容)
+function surge(content, url) {
+	let 每行内容;
+	if (content.includes('\r\n')){
+		每行内容 = content.split('\r\n');
+	} else {
+		每行内容 = content.split('\n');
+	}
 
-	return content;
+	let 输出内容 = "";
+	for (let x of 每行内容) {
+		if (x.includes('= trojan,')) {
+			const host = x.split("sni=")[1].split(",")[0];
+			const 备改内容 = `skip-cert-verify=true, tfo=false, udp-relay=false`;
+			const 正确内容 = `skip-cert-verify=true, ws=true, ws-path=/?ed=2560, ws-headers=Host:"${host}", tfo=false, udp-relay=false`;
+			输出内容 += x.replace(new RegExp(备改内容, 'g'), 正确内容).replace("[", "").replace("]", "") + '\n';
+		} else {
+			输出内容 += x + '\n';
+		}
+	}
+
+	输出内容 = `#!MANAGED-CONFIG ${url} interval=86400 strict=false` + 输出内容.substring(输出内容.indexOf('\n'));
+	return 输出内容;
 }
 
 /**
@@ -1376,4 +1455,258 @@ function surge(content, host) {
 		});
 	  }
 	}
-  })();
+})();
+
+async function getAccountId(email, key) {
+	try {
+		const url = 'https://api.cloudflare.com/client/v4/accounts';
+		const headers = new Headers({
+			'X-AUTH-EMAIL': email,
+			'X-AUTH-KEY': key
+		});
+		const response = await fetch(url, { headers });
+		const data = await response.json();
+		return data.result[0].id; // 假设我们需要第一个账号ID
+	} catch (error) {
+		return false ;
+	}
+}
+
+async function getSum(accountId, accountIndex, email, key, startDate, endDate) {
+	try {
+		const startDateISO = new Date(startDate).toISOString();
+		const endDateISO = new Date(endDate).toISOString();
+	
+		const query = JSON.stringify({
+			query: `query getBillingMetrics($accountId: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
+				viewer {
+					accounts(filter: {accountTag: $accountId}) {
+						pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) {
+							sum {
+								requests
+							}
+						}
+						workersInvocationsAdaptive(limit: 10000, filter: $filter) {
+							sum {
+								requests
+							}
+						}
+					}
+				}
+			}`,
+			variables: {
+				accountId,
+				filter: { datetime_geq: startDateISO, datetime_leq: endDateISO }
+			},
+		});
+	
+		const headers = new Headers({
+			'Content-Type': 'application/json',
+			'X-AUTH-EMAIL': email,
+			'X-AUTH-KEY': key,
+		});
+	
+		const response = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
+			method: 'POST',
+			headers: headers,
+			body: query
+		});
+	
+		if (!response.ok) {
+			throw new Error(`HTTP error! status: ${response.status}`);
+		}
+	
+		const res = await response.json();
+	
+		const pagesFunctionsInvocationsAdaptiveGroups = res?.data?.viewer?.accounts?.[accountIndex]?.pagesFunctionsInvocationsAdaptiveGroups;
+		const workersInvocationsAdaptive = res?.data?.viewer?.accounts?.[accountIndex]?.workersInvocationsAdaptive;
+	
+		if (!pagesFunctionsInvocationsAdaptiveGroups && !workersInvocationsAdaptive) {
+			throw new Error('找不到数据');
+		}
+	
+		const pagesSum = pagesFunctionsInvocationsAdaptiveGroups.reduce((a, b) => a + b?.sum.requests, 0);
+		const workersSum = workersInvocationsAdaptive.reduce((a, b) => a + b?.sum.requests, 0);
+	
+		//console.log(`范围: ${startDateISO} ~ ${endDateISO}\n默认取第 ${accountIndex} 项`);
+	
+		return [pagesSum, workersSum ];
+	} catch (error) {
+		return [ 0, 0 ];
+	}
+}
+
+/**
+ * 
+ * @param {number} addressType
+ * @param {string} addressRemote
+ * @param {number} portRemote
+ * @param {function} log The logging function.
+ */
+async function socks5Connect(addressType, addressRemote, portRemote, log) {
+	const { username, password, hostname, port } = parsedSocks5Address;
+	// Connect to the SOCKS server
+	const socket = connect({
+		hostname,
+		port,
+	});
+
+	// Request head format (Worker -> Socks Server):
+	// +----+----------+----------+
+	// |VER | NMETHODS | METHODS  |
+	// +----+----------+----------+
+	// | 1  |    1     | 1 to 255 |
+	// +----+----------+----------+
+
+	// https://en.wikipedia.org/wiki/SOCKS#SOCKS5
+	// For METHODS:
+	// 0x00 NO AUTHENTICATION REQUIRED
+	// 0x02 USERNAME/PASSWORD https://datatracker.ietf.org/doc/html/rfc1929
+	const socksGreeting = new Uint8Array([5, 2, 0, 2]);
+
+	const writer = socket.writable.getWriter();
+
+	await writer.write(socksGreeting);
+	log('sent socks greeting');
+
+	const reader = socket.readable.getReader();
+	const encoder = new TextEncoder();
+	let res = (await reader.read()).value;
+	// Response format (Socks Server -> Worker):
+	// +----+--------+
+	// |VER | METHOD |
+	// +----+--------+
+	// | 1  |   1    |
+	// +----+--------+
+	if (res[0] !== 0x05) {
+		log(`socks server version error: ${res[0]} expected: 5`);
+		return;
+	}
+	if (res[1] === 0xff) {
+		log("no acceptable methods");
+		return;
+	}
+
+	// if return 0x0502
+	if (res[1] === 0x02) {
+		log("socks server needs auth");
+		if (!username || !password) {
+			log("please provide username/password");
+			return;
+		}
+		// +----+------+----------+------+----------+
+		// |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+		// +----+------+----------+------+----------+
+		// | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+		// +----+------+----------+------+----------+
+		const authRequest = new Uint8Array([
+			1,
+			username.length,
+			...encoder.encode(username),
+			password.length,
+			...encoder.encode(password)
+		]);
+		await writer.write(authRequest);
+		res = (await reader.read()).value;
+		// expected 0x0100
+		if (res[0] !== 0x01 || res[1] !== 0x00) {
+			log("fail to auth socks server");
+			return;
+		}
+	}
+
+	// Request data format (Worker -> Socks Server):
+	// +----+-----+-------+------+----------+----------+
+	// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
+	// ATYP: address type of following address
+	// 0x01: IPv4 address
+	// 0x03: Domain name
+	// 0x04: IPv6 address
+	// DST.ADDR: desired destination address
+	// DST.PORT: desired destination port in network octet order
+
+	// addressType
+	// 0x01: IPv4 address
+	// 0x03: Domain name
+	// 0x04: IPv6 address
+	// 1--> ipv4  addressLength =4
+	// 2--> domain name
+	// 3--> ipv6  addressLength =16
+	let DSTADDR;	// DSTADDR = ATYP + DST.ADDR
+	switch (addressType) {
+		case 1:
+			DSTADDR = new Uint8Array(
+				[1, ...addressRemote.split('.').map(Number)]
+			);
+			break;
+		case 3:
+			DSTADDR = new Uint8Array(
+				[3, addressRemote.length, ...encoder.encode(addressRemote)]
+			);
+			break;
+		case 4:
+			DSTADDR = new Uint8Array(
+				[4, ...addressRemote.split(':').flatMap(x => [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2), 16)])]
+			);
+			break;
+		default:
+			log(`invild  addressType is ${addressType}`);
+			return;
+	}
+	const socksRequest = new Uint8Array([5, 1, 0, ...DSTADDR, portRemote >> 8, portRemote & 0xff]);
+	await writer.write(socksRequest);
+	log('sent socks request');
+
+	res = (await reader.read()).value;
+	// Response format (Socks Server -> Worker):
+	//  +----+-----+-------+------+----------+----------+
+	// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
+	if (res[1] === 0x00) {
+		log("socks connection opened");
+	} else {
+		log("fail to open socks connection");
+		return;
+	}
+	writer.releaseLock();
+	reader.releaseLock();
+	return socket;
+}
+
+
+/**
+ * 
+ * @param {string} address
+ */
+function socks5AddressParser(address) {
+	let [latter, former] = address.split("@").reverse();
+	let username, password, hostname, port;
+	if (former) {
+		const formers = former.split(":");
+		if (formers.length !== 2) {
+			throw new Error('Invalid SOCKS address format');
+		}
+		[username, password] = formers;
+	}
+	const latters = latter.split(":");
+	port = Number(latters.pop());
+	if (isNaN(port)) {
+		throw new Error('Invalid SOCKS address format');
+	}
+	hostname = latters.join(":");
+	const regex = /^\[.*\]$/;
+	if (hostname.includes(":") && !regex.test(hostname)) {
+		throw new Error('Invalid SOCKS address format');
+	}
+	return {
+		username,
+		password,
+		hostname,
+		port,
+	}
+}
